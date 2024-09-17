@@ -1,0 +1,12 @@
+/ {
+	chosen {
+		zephyr,console = &puart0;
+		zephyr,shell-uart = &puart0;
+	};
+
+	puart0: _puart_0 {
+		status = "okay";
+		compatible = "zephyr,posix-pipe-uart";
+		current-speed = <0>;
+	};
+};
