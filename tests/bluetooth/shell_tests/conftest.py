@@ -22,7 +22,7 @@ class PipeSerial:
         self.fifo_tx = Path(h2c_fifo)
         self.fifo_rx = Path(str(h2c_fifo).replace("h2c", "c2h"))
         self.name = str(str(h2c_fifo).replace("-h2c.fifo", ""))
-        self.lock = Path(str(h2c_fifo).replace("-h2c.fifi", ".lock"))
+        self.lock = Path(str(h2c_fifo).replace("-h2c.fifo", ".lock"))
 
     def open(self):
         if self.lock.is_file():
@@ -36,8 +36,8 @@ class PipeSerial:
         except OSError as e:
             raise Exception(f"Failed to open {e.filename} (err: {e.errno})")
 
-        with open(self.lock, "w") as file:
-            file.write(f"locked by PID {os.getpid()}\n")
+        with open(self.lock, "w") as f:
+            f.write(f"locked by PID {os.getpid()}\n")
 
         print(f"Opened device {self.name}")
 
@@ -86,7 +86,6 @@ class PipeSerial:
 
     def write(self, payload: bytes) -> int:
         try:
-            print(f"{payload}")
             written = self.tx.write(payload)
         except BlockingIOError:
             raise Exception("OS failed to write")
@@ -142,6 +141,7 @@ class ShellDevice:
         self.thread = SerialThread(com_port, bsim_device=bsim_device, rx_handler=self.rx_handler)
 
         self.rx_buf = b""
+        self._rx_log = b""
         self.rx_queue = queue.Queue()
 
     def open(self):
@@ -152,6 +152,7 @@ class ShellDevice:
 
     def rx_handler(self, data: bytes):
         self.rx_buf += data
+        self._rx_log += data
 
         if self.rx_buf.endswith(b"\n"):
             self.rx_queue.put(self.rx_buf)
@@ -162,9 +163,6 @@ class ShellDevice:
         data = bytearray(cmd, encoding="utf-8")
 
         self.thread.send(data)
-
-    def _bytes_to_str(self, data: bytes):
-        return "".join(f"{byte:02x}" for byte in data)
 
     def wait_for(self, regex: str, timeout: float = 5) -> str:
         start_time = time.time()
@@ -181,6 +179,18 @@ class ShellDevice:
                 return data_str
 
         return None
+
+    @property
+    def rx_log(self):
+        return self._rx_log.decode("utf-8")
+
+    @rx_log.setter
+    def rx_log(self, value):
+        self._rx_log = value
+
+    @rx_log.deleter
+    def rx_log(self):
+        del self._rx_log
 
     def pipe_to_stdout(self):
         while True:
@@ -305,36 +315,13 @@ def two_device_fixture(request):
 
     yield (d1, d2)
 
+    bold = "\x1b[1m"
+    reset = "\x1b[0m"
+
+    print(f"\n\n{bold}--- Device 1:{reset}\n{d1.rx_log}", end="")
+    print(f"\n\n{bold}--- Device 2:{reset}\n{d2.rx_log}", end="")
+
     stop_bsim()
     d1.close()
     d2.close()
     stop_bsim()
-
-
-def _main():
-    hci_uart_exe = Path("app/hci_sim/build/hci_sim/zephyr/zephyr.exe")
-
-    devices = instantiate_hci_uart_devices(1, hci_uart_exe, "myid")
-
-    d1 = ShellDevice(devices[0]["pipes"]["h2c"], bsim_device=True)
-    # d2 = ShellDevice(devices[1]["pipes"]["h2c"], bsim_device=True)
-
-    d1.open()
-    # d2.open()
-
-    # while True:
-        # time.sleep(.0001)
-
-    time.sleep(5)
-
-    d1.send_cmd("bt init")
-
-    d1.pipe_to_stdout()
-
-    d1.wait_for(r"Bluetooth initialized.*")
-
-    print("bt initialized")
-
-    # devices[0]["process"].kill()
-    stop_bsim()
-    d1.close()

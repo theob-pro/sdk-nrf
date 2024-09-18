@@ -6,7 +6,7 @@
 # express written agreement with Nordic Semiconductor ASA.
 ##########################################################################################
 
-import pytest
+import time
 
 
 def test_adv(two_device_fixture):
@@ -14,6 +14,8 @@ def test_adv(two_device_fixture):
 
     d1.send_cmd("bt init")
     d2.send_cmd("bt init")
+
+    time.sleep(1)
 
     d1.send_cmd("bt advertise on")
 
