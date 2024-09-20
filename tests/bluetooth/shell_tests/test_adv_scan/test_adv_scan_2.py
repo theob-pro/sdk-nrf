@@ -6,20 +6,22 @@
 # express written agreement with Nordic Semiconductor ASA.
 ##########################################################################################
 
-import time
+from conftest import Command
 
 
-def test_adv(two_device_fixture):
-    d1, d2 = two_device_fixture
+def test_adv_scan_2(two_device_fixture_2):
+    d1, d2 = two_device_fixture_2
 
-    d1.send_cmd("bt init")
-    d2.send_cmd("bt init")
+    bt_init = Command("bt init", "Bluetooth initialized")
+    bt_advertiser_on = Command("bt advertise on", "Advertising started")
+    bt_scan_on = Command("bt scan on", "Bluetooth active scan enabled")
 
-    time.sleep(1)
+    d1.send_cmd_sync(bt_init)
+    d2.send_cmd_sync(bt_init)
 
-    d1.send_cmd("bt advertise on")
+    d1.send_cmd_sync(bt_advertiser_on)
 
-    d2.send_cmd("bt scan on")
+    d2.send_cmd_sync(bt_scan_on)
 
     result = d2.wait_for(r".*AD evt type 4.*", timeout=2)
 

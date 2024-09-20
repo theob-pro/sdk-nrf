@@ -15,6 +15,17 @@ import re
 import queue
 import subprocess
 import pytest
+from abc import ABC, abstractmethod
+import struct
+import stat
+
+
+class Command():
+    def __init__(self, cmd: str, cmd_complete: str):
+        self.PB_MSG_WAIT = 0x01
+
+        self.cmd = cmd
+        self.cmd_complete = f"{cmd_complete}"
 
 
 class PipeSerial:
@@ -86,6 +97,7 @@ class PipeSerial:
 
     def write(self, payload: bytes) -> int:
         try:
+            # import pdb;pdb.set_trace()
             written = self.tx.write(payload)
         except BlockingIOError:
             raise Exception("OS failed to write")
@@ -133,16 +145,129 @@ class SerialThread(threading.Thread):
         self.uart.close()
 
     def send(self, data: bytearray):
+        # import pdb;pdb.set_trace()
         self.uart.write(data)
 
 
-class ShellDevice:
-    def __init__(self, com_port: str, baud_rate: int = 1000000, bsim_device=False):
+class Device(ABC):
+    @abstractmethod
+    def __init__(self, com_port: str, baud_rate: int = 1000000, bsim_device: bool = False):
+        pass
+
+    @abstractmethod
+    def open(self):
+        pass
+
+    @abstractmethod
+    def close(self):
+        pass
+
+    @abstractmethod
+    def rx_handler(self):
+        pass
+
+    @abstractmethod
+    def send_cmd(self):
+        pass
+
+
+class BsimTimeManager():
+    # The device wants to wait
+    PB_MSG_WAIT = 0x01
+    # The device is disconnecting from the phy or viceversa:
+    PB_MSG_DISCONNECT = 0xFFFF
+    # The device is disconnecting from the phy, and is requesting the phy to end the simulation ASAP
+    PB_MSG_TERMINATE = 0xFFFE
+    # The requested time tick has just finished
+    PB_MSG_WAIT_END = 0x81
+
+    def __init__(self, device_id: int, simulation_id: str):
+        self.device_id = device_id
+        self.simulation_id = simulation_id
+
+        self.time = 0
+
+    def __write_to_phy(self, data: bytes):
+        self.phy_fifo_tx.write(data)
+
+    def __read_from_phy(self, nbytes: int) -> bytes:
+        data = self.phy_fifo_rx.read(nbytes)
+
+        if len(data) != nbytes:
+            raise Exception(f"Did not receive the expected number of bytes when reading from PHY (got {len(data)} when {nbytes} was expected)")
+
+        return data
+
+    def connect(self):
+        user = get_user()
+
+        com_folder = Path(f"/tmp/bs_{user}/{self.simulation_id}")
+        os.makedirs(com_folder, stat.S_IRWXG | stat.S_IRWXU, exist_ok=True)
+
+        lock = com_folder / f"2G4.d{self.device_id}.lock"
+
+        if lock.exists():
+            raise Exception(f"Lock file exist (you may want to delete '{lock}')")
+
+        with open(lock, "w") as f:
+            f.write(f"{os.getpid()}\n")
+
+        self.phy_fifo_rx_path = com_folder / f"2G4.d{self.device_id}.ptd"
+        self.phy_fifo_tx_path = com_folder / f"2G4.d{self.device_id}.dtp"
+
+        if not self.phy_fifo_rx_path.exists():
+            os.mkfifo(self.phy_fifo_rx_path, stat.S_IRWXG | stat.S_IRWXU)
+        if not self.phy_fifo_tx_path.exists():
+            os.mkfifo(self.phy_fifo_tx_path, stat.S_IRWXG | stat.S_IRWXU)
+
+        # import pdb;pdb.set_trace()
+        # the order is important see:
+        # https://github.com/EDTTool/EDTT/blob/b9ca3c7030518f07b7937dacf970d37a47865a76/src/components/edttt_bsim.py#L91
+        self.phy_fifo_rx = open(self.phy_fifo_rx_path, "rb", buffering=0)
+        self.phy_fifo_tx = open(self.phy_fifo_tx_path, "wb", buffering=0)
+
+    def disconnect(self):
+        self.phy_fifo_rx.close()
+        self.phy_fifo_tx.close()
+
+        self.phy_fifo_rx_path.unlink(missing_ok=True)
+        self.phy_fifo_rx_path.unlink(missing_ok=True)
+
+    def _wait_until_t(self, wait_end: int):
+        # wait_end is in ms
+        msg = struct.pack("=IQ", self.PB_MSG_WAIT, wait_end)
+        self.__write_to_phy(msg)
+
+        self.time = wait_end
+
+        raw_header = self.__read_from_phy(4)
+        header, = struct.unpack("=I", raw_header)
+
+        if header == self.PB_MSG_DISCONNECT:
+            raise Exception("Simulation terminated by the PHY")
+        elif header != self.PB_MSG_WAIT_END:
+            raise Exception(f"Low level communication with PHY failed. Received invalid response {header}")
+
+        # wait a bit to avoid being locked if wait is called too quickly after
+        time.sleep(.001)
+
+    def wait(self, wait_time: int):
+        # import pdb; pdb.set_trace()
+        # print(f'Wait {wait_time} ms, self.time {self.time}')
+        wait_end = self.time + (wait_time * 1000)
+
+        self._wait_until_t(wait_end)
+
+
+class ShellDevice(Device):
+    def __init__(self, com_port: str, baud_rate: int = 1000000, bsim_device=False, time_manager: BsimTimeManager = None):
         self.thread = SerialThread(com_port, bsim_device=bsim_device, rx_handler=self.rx_handler)
 
         self.rx_buf = b""
         self._rx_log = b""
         self.rx_queue = queue.Queue()
+
+        self.time_manager = time_manager
 
     def open(self):
         self.thread.open()
@@ -164,12 +289,30 @@ class ShellDevice:
 
         self.thread.send(data)
 
-    def wait_for(self, regex: str, timeout: float = 5) -> str:
+    def send_cmd_sync(self, cmd: Command, timeout: int = 5):
+        self.send_cmd(cmd.cmd)
+
         start_time = time.time()
 
         while (time.time() - start_time) < timeout:
             if self.rx_queue.empty():
-                time.sleep(.0001)
+                self.time_manager.wait(100)
+                continue
+
+            line_out = self.rx_queue.get().decode("utf-8").strip()
+
+            if line_out == cmd.cmd_complete:
+                return
+
+        raise Exception(f"Command timeout: {cmd.cmd}. The line {cmd.cmd_complete} was not found after {timeout}s.")
+
+    def wait_for(self, regex: str, timeout: int = 5) -> str:
+        start_time = time.time()
+
+        while (time.time() - start_time) < timeout:
+            if self.rx_queue.empty():
+                # time.sleep(.0001)
+                self.time_manager.wait(10)
                 continue
 
             queued_data = self.rx_queue.get()
@@ -203,7 +346,7 @@ class ShellDevice:
             print(data_str, end="", file=sys.stdout)
 
 
-def get_bsim_out_path():
+def get_bsim_out_path() -> Path:
     try:
         bsim_out_path = Path(os.environ["BSIM_OUT_PATH"]).expanduser()
     except KeyError:
@@ -212,6 +355,15 @@ def get_bsim_out_path():
         raise Exception("Could not resolve HOME directory")
 
     return bsim_out_path
+
+
+def get_user() -> str:
+    try:
+        user = os.environ["USER"]
+    except KeyError:
+        raise Exception("Environment variable '$USER' is not set")
+
+    return user
 
 
 def stop_bsim():
@@ -232,10 +384,8 @@ def stop_bsim():
 
 
 def instantiate_hci_uart_devices(num_devices: int, image_path: Path, simulation_id: str):
-    bsim_id = "shell_tests"
-    simulation_id = bsim_id
     # TODO: use real temp folder
-    fifo_path = Path("/tmp/shell_tests")
+    fifo_path = Path(f"/tmp/shell_tests/{simulation_id}")
 
     bsim_out_path = get_bsim_out_path()
 
@@ -281,13 +431,13 @@ def instantiate_hci_uart_devices(num_devices: int, image_path: Path, simulation_
             "lock": lock_file,
         })
 
-    handbrake_cmd = [
-        handbrake_exe,
-        f"-s={simulation_id}",
-        f"-d={num_devices}",
-        "-r=10"
-    ]
-    subprocess.Popen(handbrake_cmd, cwd=handbrake_exe.parent)
+    # handbrake_cmd = [
+    #     handbrake_exe,
+    #     f"-s={simulation_id}",
+    #     f"-d={num_devices}",
+    #     "-r=10"
+    # ]
+    # subprocess.Popen(handbrake_cmd, cwd=handbrake_exe.parent)
 
     phy_cmd = [
         phy_exe,
@@ -322,6 +472,39 @@ def two_device_fixture(request):
     print(f"\n\n{bold}--- Device 2:{reset}\n{d2.rx_log}", end="")
 
     stop_bsim()
+    d1.close()
+    d2.close()
+    stop_bsim()
+
+
+@pytest.fixture
+def two_device_fixture_2(request):
+    test_name = request.node.name
+
+    hci_uart_exe = Path("app/hci_sim/build/hci_sim/zephyr/zephyr.exe")
+
+    devices = instantiate_hci_uart_devices(2, hci_uart_exe, test_name)
+
+    time_manager = BsimTimeManager(2, test_name)
+
+    d1 = ShellDevice(devices[0]["pipes"]["h2c"], bsim_device=True, time_manager=time_manager)
+    d2 = ShellDevice(devices[1]["pipes"]["h2c"], bsim_device=True, time_manager=time_manager)
+
+    d1.open()
+    d2.open()
+
+    time_manager.connect()
+
+    yield (d1, d2)
+
+    bold = "\x1b[1m"
+    reset = "\x1b[0m"
+
+    print(f"\n\n{bold}--- Device 1:{reset}\n{d1.rx_log}", end="")
+    print(f"\n\n{bold}--- Device 2:{reset}\n{d2.rx_log}", end="")
+
+    stop_bsim()
+    time_manager.disconnect()
     d1.close()
     d2.close()
     stop_bsim()
